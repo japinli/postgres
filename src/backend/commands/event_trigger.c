@@ -112,6 +112,7 @@ static void EventTriggerInvoke(List *fn_oid_list, EventTriggerData *trigdata);
 static const char *stringify_grant_objtype(ObjectType objtype);
 static const char *stringify_adefprivs_objtype(ObjectType objtype);
 static void SetDatabaseHasLoginEventTriggers(void);
+static void SetDatabaseHasLogoffEventTriggers(void);
 
 /*
  * Create an event trigger.
@@ -143,6 +144,7 @@ CreateEventTrigger(CreateEventTrigStmt *stmt)
 		strcmp(stmt->eventname, "ddl_command_end") != 0 &&
 		strcmp(stmt->eventname, "sql_drop") != 0 &&
 		strcmp(stmt->eventname, "login") != 0 &&
+		strcmp(stmt->eventname, "logoff") != 0 &&
 		strcmp(stmt->eventname, "table_rewrite") != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
@@ -179,6 +181,10 @@ CreateEventTrigger(CreateEventTrigStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("tag filtering is not supported for login event triggers")));
+	else if (strcmp(stmt->eventname, "logoff") == 0 && tags != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("tag filtering is not supported for logoff event triggers")));
 
 	/*
 	 * Give user a nice error message if an event trigger of the same name
@@ -317,6 +323,13 @@ insert_event_trigger_tuple(const char *trigname, const char *eventname, Oid evtO
 	if (strcmp(eventname, "login") == 0)
 		SetDatabaseHasLoginEventTriggers();
 
+	/*
+	 * Logoff event triggers have an additional flag in pg_database to enable
+	 * faster lookups in hot codepaths. Set the flag unless already True.
+	 */
+	if (strcmp(eventname, "logoff") == 0)
+		SetDatabaseHasLogoffEventTriggers();
+
 	/* Depend on owner. */
 	recordDependencyOnOwner(EventTriggerRelationId, trigoid, evtOwner);
 
@@ -414,6 +427,44 @@ SetDatabaseHasLoginEventTriggers(void)
 }
 
 /*
+ * Set pg_database.dathaslogoffevt flag for current database indicating that
+ * current database has on logoff event triggers.
+ */
+void
+SetDatabaseHasLogoffEventTriggers(void)
+{
+	/* Set dathaslogoffevt flag in pg_database */
+	Form_pg_database db;
+	Relation	pg_db = table_open(DatabaseRelationId, RowExclusiveLock);
+	HeapTuple	tuple;
+
+	/*
+	 * Use shared lock to prevent a conflict with EventTriggerOnLogoff() trying
+	 * to reset pg_database.dathaslogoffevt flag.  Note, this lock doesn't
+	 * effectively blocks database or other objection.  It's just custom lock
+	 * tag used to prevent multiple backends changing
+	 * pg_database.dathaslogoffevt flag.
+	 */
+	LockSharedObject(DatabaseRelationId, MyDatabaseId, 0, AccessExclusiveLock);
+
+	tuple = SearchSysCacheCopy1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	db = (Form_pg_database) GETSTRUCT(tuple);
+	if (!db->dathaslogoffevt)
+	{
+		db->dathaslogoffevt = true;
+		CatalogTupleUpdate(pg_db, &tuple->t_self, tuple);
+		CommandCounterIncrement();
+
+		/* take effect for the current session */
+		MyDatabaseHasLogoffEventTriggers = true;
+	}
+	table_close(pg_db, RowExclusiveLock);
+	heap_freetuple(tuple);
+}
+
+/*
  * ALTER EVENT TRIGGER foo ENABLE|DISABLE|ENABLE ALWAYS|REPLICA
  */
 Oid
@@ -454,6 +505,14 @@ AlterEventTrigger(AlterEventTrigStmt *stmt)
 	if (namestrcmp(&evtForm->evtevent, "login") == 0 &&
 		tgenabled != TRIGGER_DISABLED)
 		SetDatabaseHasLoginEventTriggers();
+
+	/*
+	 * Logoff event triggers have an additional flag in pg_database to enable
+	 * faster lookups in hot codepaths. Set the flag unless already True.
+	 */
+	if (namestrcmp(&evtForm->evtevent, "logoff") == 0 &&
+		tgenabled != TRIGGER_DISABLED)
+		SetDatabaseHasLogoffEventTriggers();
 
 	InvokeObjectPostAlterHook(EventTriggerRelationId,
 							  trigoid, 0);
@@ -618,6 +677,8 @@ EventTriggerGetTag(Node *parsetree, EventTriggerEvent event)
 {
 	if (event == EVT_Login)
 		return CMDTAG_LOGIN;
+	else if (event == EVT_Logoff)
+		return CMDTAG_LOGOFF;
 	else
 		return CreateCommandTag(parsetree);
 }
@@ -660,7 +721,8 @@ EventTriggerCommonSetup(Node *parsetree,
 		if (event == EVT_DDLCommandStart ||
 			event == EVT_DDLCommandEnd ||
 			event == EVT_SQLDrop ||
-			event == EVT_Login)
+			event == EVT_Login ||
+			event == EVT_Logoff)
 		{
 			if (!command_tag_event_trigger_ok(dbgtag))
 				elog(ERROR, "unexpected command tag \"%s\"", GetCommandTagName(dbgtag));
@@ -998,6 +1060,123 @@ EventTriggerOnLogin(void)
 	CommitTransactionCommand();
 }
 
+/*
+ * Fire logoff event triggers if any are present.  The dathaslogoffevt
+ * pg_database flag is left unchanged when an event trigger is dropped to avoid
+ * complicating the codepath in the case of multiple event triggers.  This
+ * function will instead unset the flag if no trigger is defined.
+ */
+void
+EventTriggerOnLogoff(int code, Datum arg)
+{
+	List	   *runlist;
+	EventTriggerData trigdata;
+
+	/*
+	 * See EventTriggerDDLCommandStart for a discussion about why event
+	 * triggers are disabled in single user mode or via a GUC.  We also need a
+	 * database connection (some background workers don't have it).
+	 */
+	if (!IsUnderPostmaster || !event_triggers ||
+		!OidIsValid(MyDatabaseId) || !MyDatabaseHasLogoffEventTriggers)
+		return;
+
+	StartTransactionCommand();
+	runlist = EventTriggerCommonSetup(NULL,
+									  EVT_Logoff, "logoff",
+									  &trigdata, false);
+
+	if (runlist != NIL)
+	{
+		/*
+		 * Event trigger execution may require an active snapshot.
+		 */
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		/* Run the triggers. */
+		EventTriggerInvoke(runlist, &trigdata);
+
+		/* Cleanup. */
+		list_free(runlist);
+
+		PopActiveSnapshot();
+	}
+
+	/*
+	 * There is no active logoff event trigger, but our
+	 * pg_database.dathaslogoffevt is set. Try to unset this flag.  We use the
+	 * lock to prevent concurrent SetDatabaseHasLogoffEventTriggers(), but we
+	 * don't want to hang the connection waiting on the lock.  Thus, we are
+	 * just trying to acquire the lock conditionally.
+	 */
+	else if (ConditionalLockSharedObject(DatabaseRelationId, MyDatabaseId,
+										 0, AccessExclusiveLock))
+	{
+		/*
+		 * The lock is held.  Now we need to recheck that logoff event triggers
+		 * list is still empty.  Once the list is empty, we know that even if
+		 * there is a backend which concurrently inserts/enables a logoff event
+		 * trigger, it will update pg_database.dathaslogoffevt *afterwards*.
+		 */
+		runlist = EventTriggerCommonSetup(NULL,
+										  EVT_Logoff, "logoff",
+										  &trigdata, true);
+
+		if (runlist == NIL)
+		{
+			Relation	pg_db = table_open(DatabaseRelationId, RowExclusiveLock);
+			HeapTuple	tuple;
+			Form_pg_database db;
+			ScanKeyData key[1];
+			SysScanDesc scan;
+
+			/*
+			 * Get the pg_database tuple to scribble on.  Note that this does
+			 * not directly rely on the syscache to avoid issues with
+			 * flattened toast values for the in-place update.
+			 */
+			ScanKeyInit(&key[0],
+						Anum_pg_database_oid,
+						BTEqualStrategyNumber, F_OIDEQ,
+						ObjectIdGetDatum(MyDatabaseId));
+
+			scan = systable_beginscan(pg_db, DatabaseOidIndexId, true,
+									  NULL, 1, key);
+			tuple = systable_getnext(scan);
+			tuple = heap_copytuple(tuple);
+			systable_endscan(scan);
+
+			if (!HeapTupleIsValid(tuple))
+				elog(ERROR, "could not find tuple for database %u", MyDatabaseId);
+
+			db = (Form_pg_database) GETSTRUCT(tuple);
+			if (db->dathaslogoffevt)
+			{
+				db->dathaslogoffevt = false;
+
+				/*
+				 * Do an "in place" update of the pg_database tuple.  Doing
+				 * this instead of regular updates serves two purposes. First,
+				 * that avoids possible waiting on the row-level lock. Second,
+				 * that avoids dealing with TOAST.
+				 *
+				 * It's known that changes made by heap_inplace_update() may
+				 * be lost due to concurrent normal updates.  However, we are
+				 * OK with that.  The subsequent connections will still have a
+				 * chance to set "dathaslogoffevt" to false.
+				 */
+				heap_inplace_update(pg_db, tuple);
+			}
+			table_close(pg_db, RowExclusiveLock);
+			heap_freetuple(tuple);
+		}
+		else
+		{
+			list_free(runlist);
+		}
+	}
+	CommitTransactionCommand();
+}
 
 /*
  * Fire table_rewrite triggers.

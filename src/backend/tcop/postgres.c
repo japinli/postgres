@@ -4315,6 +4315,14 @@ PostgresMain(const char *dbname, const char *username)
 	EventTriggerOnLogin();
 
 	/*
+	 * Register a callback to fire any defined logoff event triggers, if
+	 * appropriate.
+	 */
+	if (IsUnderPostmaster)
+		before_shmem_exit(EventTriggerOnLogoff, 0);
+
+
+	/*
 	 * POSTGRES main processing loop begins here
 	 *
 	 * If an exception is encountered, processing resumes here so we abort the

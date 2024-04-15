@@ -29,6 +29,7 @@
      occurs in the database in which it is defined. Currently, the only
      supported events are
      <literal>login</literal>,
+     <literal>logoff</literal>,
      <literal>ddl_command_start</literal>,
      <literal>ddl_command_end</literal>,
      <literal>table_rewrite</literal>
@@ -52,6 +53,10 @@
      <literal>login</literal> event triggers.  Note that, for instance,
      canceling a connection in <application>psql</application> will not cancel
      the in-progress <literal>login</literal> trigger.
+   </para>
+
+   <para>
+     The <literal>logoff</literal> event occurs when a user logs off the system.
    </para>
 
    <para>
