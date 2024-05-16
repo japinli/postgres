@@ -339,6 +339,25 @@ SELECT t1 FROM ft1 t1 ORDER BY t1.c3, t1.c1 OFFSET 100 LIMIT 10;
  (110,0,00110,"Sun Jan 11 00:00:00 1970 PST","Sun Jan 11 00:00:00 1970",0,"0         ",foo)
 (10 rows)
 
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE t1.c3 > '00960' ORDER BY t1.c2 FETCH FIRST 2 ROWS WITH TIES;
+                                                           QUERY PLAN                                                            
+---------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   Output: c1, c2, c3, c4, c5, c6, c7, c8
+   ->  Foreign Scan on public.ft1 t1
+         Output: c1, c2, c3, c4, c5, c6, c7, c8
+         Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE ((c3 > '00960')) ORDER BY c2 ASC NULLS LAST
+(5 rows)
+
+SELECT * FROM ft1 t1 WHERE t1.c3 > '00960' ORDER BY t1.c2 FETCH FIRST 2 ROWS WITH TIES;
+  c1  | c2 |  c3   |              c4              |            c5            | c6 |     c7     | c8  
+------+----+-------+------------------------------+--------------------------+----+------------+-----
+  970 |  0 | 00970 | Thu Mar 12 00:00:00 1970 PST | Thu Mar 12 00:00:00 1970 | 0  | 0          | foo
+ 1000 |  0 | 01000 | Thu Jan 01 00:00:00 1970 PST | Thu Jan 01 00:00:00 1970 | 0  | 0          | foo
+  990 |  0 | 00990 | Wed Apr 01 00:00:00 1970 PST | Wed Apr 01 00:00:00 1970 | 0  | 0          | foo
+  980 |  0 | 00980 | Sun Mar 22 00:00:00 1970 PST | Sun Mar 22 00:00:00 1970 | 0  | 0          | foo
+(4 rows)
+
 -- empty result
 SELECT * FROM ft1 WHERE false;
  c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 

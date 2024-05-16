@@ -7141,6 +7141,16 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 
 	/*
+	 * Also, the FETCH FIRST/NEXT ... ROW/ROWS WITH TIES cannot be pushed down
+	 * due to the remote having:
+	 * a) a different understanding of equality, resulting in varying results,
+		  such as non-deterministic collations;
+	 * b) potential lack of support for this clause.
+	 */
+	if (parse->limitOption == LIMIT_OPTION_WITH_TIES)
+		return;
+
+	/*
 	 * Also, the LIMIT/OFFSET cannot be pushed down, if their expressions are
 	 * not safe to remote.
 	 */
