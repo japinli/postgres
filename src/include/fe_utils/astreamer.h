@@ -89,6 +89,11 @@ typedef enum
  * to be present in the archive header and used to fill the struct, after
  * which all subsequent calls for the same archive member are expected to
  * pass the same details.
+ *
+ * For tar archives, a member may be preceded by a PAX extended header.  In
+ * that case pathname and linktarget hold the values of the PAX "path" and
+ * "linkpath" attributes, which override any (possibly truncated) values in
+ * the traditional header fields.
  */
 typedef struct
 {

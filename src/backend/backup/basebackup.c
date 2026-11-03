@@ -121,6 +121,7 @@ static void sendFileWithContent(bbsink *sink, const char *filename,
 static int64 _tarWriteHeader(bbsink *sink, const char *filename,
 							 const char *linktarget, struct stat *statbuf,
 							 bool sizeonly);
+static int64 _tarGetHeaderSize(const char *filename, const char *linktarget);
 static void _tarWritePadding(bbsink *sink, int len);
 static void convert_link_to_directory(const char *pathbuf, struct stat *statbuf);
 static void perform_base_backup(basebackup_options *opt, bbsink *sink,
@@ -1559,8 +1560,8 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
 				/* Pad to a multiple of the tar block size. */
 				size += tarPaddingBytesRequired(statbuf.st_size);
 
-				/* Size of the header for the file. */
-				size += TAR_BLOCK_SIZE;
+				/* Size of the header for the file, including PAX if needed. */
+				size += _tarGetHeaderSize(tarfilename, NULL);
 			}
 		}
 		else
@@ -2119,14 +2120,46 @@ verify_page_checksum(Page page, XLogRecPtr start_lsn, BlockNumber blkno,
 	return false;
 }
 
+/*
+ * Compute the size of the tar header for a member, including the PAX
+ * extended header and its padding when one is required.
+ */
+static int64
+_tarGetHeaderSize(const char *filename, const char *linktarget)
+{
+	size_t		hdrsize = tarCreateHeaderExtSize(filename, linktarget);
+
+	if (hdrsize == 0)
+	{
+		if (linktarget != NULL && strlen(linktarget) >= MAXPGPATH)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("symbolic link target too long for tar format: "
+							"file name \"%s\", target \"%s\"",
+							filename, linktarget)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("file name too long for tar format: \"%s\"",
+							filename)));
+	}
+
+	return (int64) hdrsize;
+}
+
 static int64
 _tarWriteHeader(bbsink *sink, const char *filename, const char *linktarget,
 				struct stat *statbuf, bool sizeonly)
 {
 	enum tarError rc;
+	size_t		hdrsize = _tarGetHeaderSize(filename, linktarget);
 
 	if (!sizeonly)
 	{
+		char	   *header;
+		bool		allocated = false;
+		size_t		written;
+
 		/*
 		 * As of this writing, the smallest supported block size is 1kB, which
 		 * is twice TAR_BLOCK_SIZE. Since the buffer size is required to be a
@@ -2138,14 +2171,27 @@ _tarWriteHeader(bbsink *sink, const char *filename, const char *linktarget,
 						 "BLCKSZ too small for tar block");
 		Assert(sink->bbs_buffer_length >= TAR_BLOCK_SIZE);
 
-		rc = tarCreateHeader(sink->bbs_buffer, filename, linktarget,
-							 statbuf->st_size, statbuf->st_mode,
-							 statbuf->st_uid, statbuf->st_gid,
-							 statbuf->st_mtime);
+		/*
+		 * A PAX extended header and its payload may be larger than the sink
+		 * buffer, so allocate a temporary buffer in that case.
+		 */
+		if (hdrsize <= sink->bbs_buffer_length)
+			header = sink->bbs_buffer;
+		else
+		{
+			header = palloc(hdrsize);
+			allocated = true;
+		}
+
+		rc = tarCreateHeaderExt(header, hdrsize, filename, linktarget,
+								statbuf->st_size, statbuf->st_mode,
+								statbuf->st_uid, statbuf->st_gid,
+								statbuf->st_mtime, &written);
 
 		switch (rc)
 		{
 			case TAR_OK:
+				Assert(written == hdrsize);
 				break;
 			case TAR_NAME_TOO_LONG:
 				ereport(ERROR,
@@ -2160,14 +2206,33 @@ _tarWriteHeader(bbsink *sink, const char *filename, const char *linktarget,
 								"file name \"%s\", target \"%s\"",
 								filename, linktarget)));
 				break;
+			case TAR_BUFFER_TOO_SMALL:
+				elog(ERROR, "tar header buffer is too small");
+				break;
 			default:
 				elog(ERROR, "unrecognized tar error: %d", rc);
 		}
 
-		bbsink_archive_contents(sink, TAR_BLOCK_SIZE);
+		if (!allocated)
+			bbsink_archive_contents(sink, hdrsize);
+		else
+		{
+			size_t		done = 0;
+
+			while (done < hdrsize)
+			{
+				size_t		nbytes = Min(hdrsize - done,
+										 sink->bbs_buffer_length);
+
+				memcpy(sink->bbs_buffer, header + done, nbytes);
+				bbsink_archive_contents(sink, nbytes);
+				done += nbytes;
+			}
+			pfree(header);
+		}
 	}
 
-	return TAR_BLOCK_SIZE;
+	return (int64) hdrsize;
 }
 
 /*

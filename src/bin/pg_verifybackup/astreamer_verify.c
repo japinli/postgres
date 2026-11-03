@@ -162,7 +162,8 @@ member_verify_header(astreamer *streamer, astreamer_member *member)
 {
 	astreamer_verify *mystreamer = (astreamer_verify *) streamer;
 	manifest_file *m;
-	char		pathname[MAXPGPATH];
+	char		pathname[MAXPGPATH + 32];
+	int			pathlen;
 
 	/* We are only interested in normal files. */
 	if (!member->is_regular)
@@ -180,10 +181,21 @@ member_verify_header(astreamer *streamer, astreamer_member *member)
 	 * to make sure that canonicalize_path() does what we want.
 	 */
 	if (OidIsValid(mystreamer->tblspc_oid))
-		snprintf(pathname, MAXPGPATH, "%s/%u/%s",
-				 "pg_tblspc", mystreamer->tblspc_oid, member->pathname);
+		pathlen = snprintf(pathname, sizeof(pathname), "%s/%u/%s",
+						   "pg_tblspc", mystreamer->tblspc_oid,
+						   member->pathname);
 	else
-		snprintf(pathname, MAXPGPATH, "./%s", member->pathname);
+		pathlen = snprintf(pathname, sizeof(pathname), "./%s",
+						   member->pathname);
+
+	if (pathlen < 0 || pathlen >= (int) sizeof(pathname))
+	{
+		report_backup_error(mystreamer->context,
+							"file name \"%s\" in archive \"%s\" is too long",
+							member->pathname, mystreamer->archive_name);
+		return;
+	}
+
 	canonicalize_path(pathname);
 
 	/* Ignore any files that are listed in the ignore list. */

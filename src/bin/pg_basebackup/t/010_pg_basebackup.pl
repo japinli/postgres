@@ -5,7 +5,7 @@ use strict;
 use warnings FATAL => 'all';
 use Config;
 use File::Basename qw(basename dirname);
-use File::Path     qw(rmtree);
+use File::Path     qw(make_path rmtree);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -380,24 +380,64 @@ $node->command_fails_like(
 	'--tablespace-mapping with invalid format fails');
 
 my $superlongname = "superlongname_" . ("x" x 100);
-# Tar format doesn't support filenames longer than 100 bytes.
+# Tar format supports long filenames using PAX extended headers.
 SKIP:
 {
 	my $superlongpath = "$pgdata/$superlongname";
 
-	skip "File path too long", 1
+	skip "File path too long", 4
 	  if $windows_os && length($superlongpath) > 255;
 
 	open my $file, '>', "$superlongpath"
 	  or die "unable to create file $superlongpath";
 	close $file;
-	$node->command_fails(
+	$node->command_ok(
 		[
 			@pg_basebackup_defs,
 			'--pgdata' => "$tempdir/tarbackup_l1",
 			'--format' => 'tar'
 		],
-		'pg_basebackup tar with long name fails');
+		'pg_basebackup tar with long name succeeds');
+	rmtree("$tempdir/tarbackup_l1");
+
+	# Tar output to stdout forces pg_basebackup to parse and re-archive the
+	# stream (to inject the manifest).  This exercises the PAX archiver path.
+	SKIP:
+	{
+		my $tar = $ENV{TAR};
+
+		skip "no tar program available", 3
+		  if (!defined $tar || $tar eq '');
+
+		my $stdout_tar = "$tempdir/long_name_stdout.tar";
+		my $stdout_extract = "$tempdir/long_name_stdout";
+		my $stderr = '';
+		my $result;
+
+		$result = IPC::Run::run(
+			[
+				@pg_basebackup_defs,
+				'--pgdata' => '-',
+				'--format' => 'tar',
+				'--wal-method' => 'none',
+				'--dbname' => $node->connstr('postgres')
+			],
+			'>', $stdout_tar,
+			'2>', \$stderr);
+		ok($result,
+			'pg_basebackup tar to stdout with long name succeeds');
+		diag("pg_basebackup stderr: $stderr") unless $result;
+		mkdir($stdout_extract)
+		  or BAIL_OUT("could not create $stdout_extract");
+		command_ok(
+			[ $tar, '-xf', $stdout_tar, '-C', $stdout_extract ],
+			'external tar extracts re-archived PAX archive');
+		ok(-f "$stdout_extract/$superlongname",
+			'long name preserved through re-archiving');
+		rmtree($stdout_extract);
+		unlink($stdout_tar);
+	}
+
 	unlink "$superlongpath";
 }
 
@@ -429,7 +469,7 @@ $node->start;
 # Test backup of a tablespace using tar format.
 # Symlink the system located tempdir to our physical temp location.
 # That way we can use shorter names for the tablespace directories,
-# which hopefully won't run afoul of the 99 character length limit.
+# which makes the resulting archives easier to inspect.
 my $real_sys_tempdir = "$sys_tempdir/tempdir";
 dir_symlink "$tempdir", $real_sys_tempdir;
 
@@ -1103,5 +1143,102 @@ $node2->command_fails_like(
 	],
 	qr/system identifier in backup manifest is .*, but database system identifier is/,
 	"pg_basebackup fails with different database system manifest");
+
+# Test support for long tablespace paths and long archive member paths.
+# Both require PAX extended headers, because they exceed the traditional
+# ustar name/prefix/linkname limits.
+my $long_ts_dir = "$tempdir/" . ('a' x 100);
+
+mkdir($long_ts_dir)
+  or BAIL_OUT("could not create $long_ts_dir");
+$node->safe_psql('postgres',
+	"CREATE TABLESPACE tblspc_long LOCATION '$long_ts_dir';");
+$node->safe_psql('postgres',
+	"CREATE TABLE test_long_ts (a int) TABLESPACE tblspc_long;"
+	  . "INSERT INTO test_long_ts VALUES (1234);");
+my $long_ts_oid = $node->safe_psql('postgres',
+	"SELECT oid FROM pg_tablespace WHERE spcname = 'tblspc_long';");
+
+# Create a file whose relative path is much longer than the ustar limit.
+my $long_relpath = join('/', map { $_ x 80 } qw(d e f h));
+my $long_filename = 'g' x 80;
+my $long_dir = "$pgdata/$long_relpath";
+
+make_path($long_dir)
+  or BAIL_OUT("could not create $long_dir");
+append_to_file("$long_dir/$long_filename", "long path contents\n");
+
+# Plain format: the long tablespace symlink target and the long path must both
+# be restored intact.
+my $long_plain_backup = "$tempdir/long_plain_backup";
+my $long_map_dir = "$tempdir/long_tblspc";
+
+rmtree($long_map_dir);
+rmtree($long_plain_backup);
+$node->command_ok(
+	[
+		@pg_basebackup_defs,
+		'--pgdata' => $long_plain_backup,
+		'--format' => 'plain',
+		'--tablespace-mapping' => "$long_ts_dir=$long_map_dir",
+	],
+	'plain backup with long tablespace path and long file path');
+
+ok(-f "$long_plain_backup/$long_relpath/$long_filename",
+	'long file path restored from plain backup');
+is(readlink("$long_plain_backup/pg_tblspc/$long_ts_oid"),
+	$long_map_dir,
+	'long tablespace symlink target restored');
+
+# Tar format: the long path must be represented with a PAX extended header,
+# and must survive both our own parser and an external tar implementation.
+my $long_tar_backup = "$tempdir/long_tar_backup";
+
+rmtree($long_tar_backup);
+$node->command_ok(
+	[
+		@pg_basebackup_defs,
+		'--pgdata' => $long_tar_backup,
+		'--format' => 'tar',
+	],
+	'tar backup with long file path');
+ok(-f "$long_tar_backup/base.tar", 'long-path tar backup was created');
+
+command_ok(
+	[
+		'pg_verifybackup', '-F', 't',
+		'-m', "$long_tar_backup/backup_manifest",
+		'-n', $long_tar_backup
+	],
+	'pg_verifybackup verifies a PAX tar backup');
+
+SKIP:
+{
+	my $tar = $ENV{TAR};
+
+	skip "no tar program available", 1
+	  if (!defined $tar || $tar eq '');
+
+	my $long_tar_extract = "$tempdir/long_tar_extract";
+
+	rmtree($long_tar_extract);
+	mkdir($long_tar_extract)
+	  or BAIL_OUT("could not create $long_tar_extract");
+	command_ok(
+		[ $tar, '-xf', "$long_tar_backup/base.tar", '-C', $long_tar_extract ],
+		'external tar extracts PAX base archive');
+	ok(-f "$long_tar_extract/$long_relpath/$long_filename",
+		'long file path restored from tar backup');
+	rmtree($long_tar_extract);
+}
+
+# Clean up.
+$node->safe_psql('postgres',
+	"DROP TABLE test_long_ts; DROP TABLESPACE tblspc_long;");
+rmtree($long_dir);
+rmtree($long_ts_dir);
+rmtree($long_map_dir);
+rmtree($long_plain_backup);
+rmtree($long_tar_backup);
 
 done_testing();
